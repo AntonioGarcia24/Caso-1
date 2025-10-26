@@ -1,8 +1,8 @@
 import os, numpy as np, pandas as pd, matplotlib.pyplot as plt, tensorflow as tf
 from tensorflow.keras import layers, models, callbacks
 
-# ================== CONFIG ==================
-EXCEL_PATH = r"C:\Users\aanto\Documents\Python\TFM\TFM_datos_sinteticos_Granada_2023_2024_demandaAlta_PR60_modificado.xlsx"
+
+EXCEL_PATH = r"C:\Users\aanto\Documents\Python\TFM\datossinteticosanuales.xlsx"
 SEQ_LEN, HORIZON = 48, 24
 BATCH_SIZE, EPOCHS = 64, 15
 OUT_DIR = "Caso1Marzo"
@@ -17,14 +17,12 @@ HARD_CUTOFF_HOUR = 19
 PREFERRED_WINDOW, PREFERRED_BONUS = (12, 15), 0.5
 AVOID_OVERLAP = True
 
-# Cargas flexibles
+# Cargas desplazadas
 THERMO_DURATION, THERMO_POWER_PER_H = 2, 1.1
 WASH_DURATION = 2  # (0.5 + 0.4)
 
-# Suavizado flex
+# Suavizado de curvas
 SMOOTH_KERNEL = np.array([0.25, 0.5, 0.25], dtype=float)
-
-# >>> NUEVO: mínimo no flexible por hora (asegura consumo nocturno)
 BASELINE_MIN_KWH = 0.8
 
 np.random.seed(42); tf.random.set_seed(42)
@@ -144,7 +142,7 @@ date_tag = pd.to_datetime(TARGET_DATE_STR).strftime("%Y%m%d")
 model_load.save(os.path.join(OUT_DIR, f"modelo_demanda_{date_tag}.h5"))
 model_pv.save(os.path.join(OUT_DIR, f"modelo_pv_{date_tag}.h5"))
 
-# ================== 4) PREDICCIÓN PARA 1-ABR (24h) ==================
+# ================== 4) PREDICCIÓN (24h) ==================
 X_target = feat[pos_start-SEQ_LEN:pos_start, :][None, :, :]
 pred_demand = model_load.predict(X_target, verbose=0)[0]  # (24,)
 pred_pv     = model_pv.predict(X_target,   verbose=0)[0]
@@ -159,7 +157,7 @@ pv_day_max = float(pred_pv.max())
 MIN_PV_FOR_LOAD = HARD_TARGET_MIN_PV if pv_day_max >= HARD_TARGET_MIN_PV else max(MIN_FLOOR, ADAPTIVE_RATIO * pv_day_max)
 print(f"[INFO] ({TARGET_DATE.date()}) Umbral PV usado: {MIN_PV_FOR_LOAD:.2f} kWh (pico predicho {pv_day_max:.2f})")
 
-# === 4.b) Métricas de error (1 de abril) ===
+# === 4.b) Métricas de error ===
 import numpy as np
 
 def compute_metrics(y_true, y_pred):
@@ -188,7 +186,7 @@ mae_p, rmse_p, mape_p, smape_p = compute_metrics(real_pv_day, pred_pv)
 print(f"[1-abr] DEMANDA — MAE: {mae_d:.3f} kWh | RMSE: {rmse_d:.3f} kWh | MAPE: {mape_d:.1f}% | sMAPE: {smape_d:.1f}%")
 print(f"[1-abr]   FOTOV — MAE: {mae_p:.3f} kWh | RMSE: {rmse_p:.3f} kWh | MAPE: {mape_p:.1f}% | sMAPE: {smape_p:.1f}%")
 
-# (Opcional) Error en TOTales diarios (un solo punto, no tiene RMSE)
+# Error en Totales diarios
 tot_err_dem = float(pred_demand.sum() - real_demand_day.sum())
 tot_err_pv  = float(pred_pv.sum()     - real_pv_day.sum())
 tot_pct_dem = (abs(tot_err_dem) / max(real_demand_day.sum(), 1e-9)) * 100.0
@@ -196,49 +194,46 @@ tot_pct_pv  = (abs(tot_err_pv)  / max(real_pv_day.sum(), 1e-9)) * 100.0
 print(f"[1-abr] Error total día — Demanda: {tot_err_dem:+.2f} kWh ({tot_pct_dem:.1f}%) | FV: {tot_err_pv:+.2f} kWh ({tot_pct_pv:.1f}%)")
 
 
-# ================== 5) GESTIÓN DE CARGAS — SIEMPRE QUEDA BASE ==================
-# Flex "original" teórica
+# ================== 5) GESTIÓN DE CARGAS  ==================
+
 orig_flex_raw = np.zeros(HORIZON)
 orig_flex_raw[21]+=1.1; orig_flex_raw[22]+=1.1; orig_flex_raw[20]+=0.5; orig_flex_raw[21]+=0.4
-
-# CAPADO por hora: no puede comer más que (pred - baseline_min)
 headroom_pred = np.maximum(pred_demand - BASELINE_MIN_KWH, 0.0)
 orig_flex = np.minimum(orig_flex_raw, headroom_pred)
-
-# Flex gestionada candidata
 managed_flex_base = np.zeros(HORIZON); forbidden = set()
+
 # TERMO
 thermo_start = choose_block_strict(pred_pv, pred_demand, THERMO_DURATION, PREFERRED_WINDOW, PREFERRED_BONUS,
                                    HARD_CUTOFF_HOUR, MIN_PV_FOR_LOAD, forbidden_hours=forbidden)
 if thermo_start is not None:
     managed_flex_base[thermo_start:thermo_start+THERMO_DURATION] += THERMO_POWER_PER_H
     if AVOID_OVERLAP: forbidden |= set(range(thermo_start, thermo_start+THERMO_DURATION))
+        
 # LAVADORA
 wsh_start = choose_block_strict(pred_pv, pred_demand, WASH_DURATION, PREFERRED_WINDOW, PREFERRED_BONUS,
                                 HARD_CUTOFF_HOUR, MIN_PV_FOR_LOAD, forbidden_hours=forbidden)
 if wsh_start is not None:
     managed_flex_base[wsh_start] += 0.5; managed_flex_base[wsh_start+1] += 0.4
 
-# Filtro + suavizado + límite por PV
+# Filtro 
 hours = np.arange(HORIZON)
 managed_flex_base[(pred_pv < MIN_PV_FOR_LOAD) | (hours >= HARD_CUTOFF_HOUR)] = 0.0
 smooth = np.convolve(managed_flex_base, SMOOTH_KERNEL, mode="same") if managed_flex_base.sum()>0 else managed_flex_base.copy()
 managed_flex_base = np.minimum(smooth, np.maximum(0.0, pred_pv))
 managed_flex_base = np.clip(managed_flex_base, 0.0, None)
 
-# Reescalados para conservar energía flexible (pred y real)
+# Reescalados para conservar energía flexible 
 managed_flex_pred = managed_flex_base.copy()
 if managed_flex_pred.sum() > 0:
     managed_flex_pred *= (orig_flex.sum() / managed_flex_pred.sum())
 
-# En real también dejamos BASELINE_MIN_KWH por hora
 headroom_real = np.maximum(real_demand_day - BASELINE_MIN_KWH, 0.0)
 orig_flex_cap_real = np.minimum(orig_flex_raw, headroom_real)
 managed_flex_real = managed_flex_base.copy()
 if managed_flex_real.sum() > 0:
     managed_flex_real *= (orig_flex_cap_real.sum() / managed_flex_real.sum())
 
-# ================== 6) MÉTRICAS (redistribución, sin sumar kWh) ==================
+# ================== 6) MÉTRICAS ==================
 cons_before_real = real_demand_day
 cons_after_real  = (real_demand_day - orig_flex_cap_real) + managed_flex_real
 assert np.isclose(cons_before_real.sum(), cons_after_real.sum(), atol=1e-6), "No se conserva energía (real)"
@@ -295,7 +290,7 @@ totals.to_csv(totals_fp, index=False, encoding="utf-8")
 print(f"\n>> CSVs guardados en: {os.path.abspath(summary_fp)}  y  {os.path.abspath(totals_fp)}")
 
 # ================== 8) GRÁFICAS ==================
-# 1) Demanda estimada vs FV estimada — SIN cargas
+# 1) Consumo estimada vs FV estimada 
 tot_dem_est = float(pred_demand.sum()); tot_pv_est  = float(pred_pv.sum())
 pv_vs_dem_pct = (tot_pv_est / tot_dem_est * 100) if tot_dem_est > 0 else float("nan")
 
@@ -343,7 +338,7 @@ print(">> Figuras guardadas en:\n  ",
       "\n  ",
       os.path.join(OUT_DIR, f"fig5_columnas_horarias_demanda_y_pv_{date_tag}.png"))
 
-# 3) Consumo REAL vs FV REAL — 1 de abril
+# 3) Consumo REAL vs FV REAL - Día de estudio
 real_tot_dem = float(real_demand_day.sum()); real_tot_pv  = float(real_pv_day.sum())
 real_cover   = (real_tot_pv / real_tot_dem * 100) if real_tot_dem > 0 else float("nan")
 
@@ -363,57 +358,3 @@ ax.text(0.99, 0.98, f"Totales del día\n• Consumo: {real_tot_dem:.2f} kWh\n•
 plt.tight_layout()
 plt.savefig(os.path.join(OUT_DIR, f"fig_real_consumo_vs_pv_{date_tag}.png"), dpi=180)
 plt.close()
-
-# ================== 9) BALANCE ENERGÉTICO CON IDENTIDADES ==================
-autoc_before = float(selfcons_before.sum())
-autoc_after  = float(selfcons_after.sum())
-imp_before   = float(import_before.sum())
-imp_after    = float(import_after.sum())
-exp_before   = float(export_before.sum())
-exp_after    = float(export_after.sum())
-
-cons_before = autoc_before + imp_before
-cons_after  = autoc_after  + imp_after
-pv_total_b  = autoc_before + exp_before
-pv_total_a  = autoc_after  + exp_after
-
-fig, ax = plt.subplots(figsize=(11,5))
-labels = ["Consumo", "Producción FV total"]
-x = np.arange(len(labels)); width = 0.36
-
-ax.bar(x[0]-width/2, autoc_before, width, label="Autoconsumo ANTES")
-ax.bar(x[0]-width/2, imp_before,  width, bottom=autoc_before, label="Importe red ANTES")
-ax.bar(x[0]+width/2, autoc_after, width, label="Autoconsumo DESPUÉS")
-ax.bar(x[0]+width/2, imp_after,  width, bottom=autoc_after,  label="Importe red DESPUÉS")
-
-ax.bar(x[1]-width/2, autoc_before, width)
-ax.bar(x[1]-width/2, exp_before,  width, bottom=autoc_before, label="Vertido ANTES")
-ax.bar(x[1]+width/2, autoc_after, width)
-ax.bar(x[1]+width/2, exp_after,  width, bottom=autoc_after,  label="Vertido DESPUÉS")
-
-ax.set_title(f"Antes vs Después — {TARGET_DATE.date()}\nIdentidades: Consumo=Autoconsumo+Red · FV=Autoconsumo+Vertido")
-ax.set_ylabel("Energía (kWh)")
-ax.set_xticks(x, labels); ax.grid(axis="y", linestyle="--", alpha=0.35)
-
-def annotate_total(xpos, total):
-    ax.text(xpos, total + 0.15, f"{total:.2f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
-
-annotate_total(x[0]-width/2, cons_before)
-annotate_total(x[0]+width/2, cons_after)
-annotate_total(x[1]-width/2, pv_total_b)
-annotate_total(x[1]+width/2, pv_total_a)
-
-ax.text(0.5, 1.02,
-        "Consumo = Autoconsumo + Importe red     ·     Producción FV = Autoconsumo + Vertido",
-        transform=ax.transAxes, ha="center", va="bottom",
-        fontsize=10, bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, edgecolor="grey"))
-
-handles, labels_ = ax.get_legend_handles_labels(); bylabel = dict(zip(labels_, handles))
-ax.legend(bylabel.values(), bylabel.keys(), ncol=3, frameon=False)
-
-plt.tight_layout()
-plt.savefig(os.path.join(OUT_DIR, f"fig_balance_identidades_{date_tag}.png"), dpi=180)
-plt.close()
-print(">> Figuras en:", os.path.join(OUT_DIR, f"fig1_pred_demanda_vs_pv_{date_tag}.png"),
-      "|", os.path.join(OUT_DIR, f"fig5_columnas_horarias_demanda_y_pv_{date_tag}.png"),
-      "|", os.path.join(OUT_DIR, f"fig_real_consumo_vs_pv_{date_tag}.png"))
