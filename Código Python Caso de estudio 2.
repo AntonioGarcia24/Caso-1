@@ -2,38 +2,36 @@ import os, numpy as np, pandas as pd, matplotlib.pyplot as plt, tensorflow as tf
 from tensorflow.keras import layers, models, callbacks
 
 # ================== CONFIG ==================
-EXCEL_PATH = r"C:\Users\aanto\Documents\Python\TFM\TFM_datos_sinteticos_Granada_2023_2024_demandaAlta_PR60_modificado.xlsx"
+EXCEL_PATH = r"C:\Users\aanto\Documents\Python\TFM\datossinteticosanuales.xlsx"
 SEQ_LEN, HORIZON = 48, 24
 BATCH_SIZE, EPOCHS = 64, 15
-OUT_DIR = "finalisima"
-
-# FECHA OBJETIVO (acepta 'YYYY-MM-DD' o 'dd-mm-YYYY')
+OUT_DIR = "Caso2"
 TARGET_DATE_STR = "2024-03-18"
 
-# Gestión FV / preferencias
+# Gestión FV
 HARD_TARGET_MIN_PV = 2.0
 ADAPTIVE_RATIO, MIN_FLOOR = 0.60, 0.5
-HARD_CUTOFF_HOUR = 19                 # hora tope para que TERMINE el bloque
+HARD_CUTOFF_HOUR = 19                
 PREFERRED_WINDOW, PREFERRED_BONUS = (12, 15), 0.5
 AVOID_OVERLAP = True
 
-# Cargas flexibles (bloques ejemplo)
+# Cargas flexibles 
 THERMO_BLOCK = np.array([1.1, 1.1], dtype=float)  # 2h termo
 WASH_BLOCK   = np.array([0.5, 0.4], dtype=float)  # 2h lavadora
 FLEX_BLOCKS  = [("termo", THERMO_BLOCK), ("lavadora", WASH_BLOCK)]
 
-# Base mínima orientativa (garantiza margen nocturno al CAPAR la flex)
+
 BASELINE_MIN_KWH = 0.20
 
 # ===== Límites de desplazamiento =====
-MAX_BLOCKS_PER_DAY   = 1      # nº máx de bloques a desplazar en el día
-MAX_SHIFT_KWH        = 1.5    # tope de kWh totales a mover (None = sin tope)
-MAX_SHIFT_FRACTION   = 0.50   # tope como % del total flexible original (None = sin tope)
-ALLOW_PARTIAL_LAST_BLOCK = False  # si el último bloque excede cupo, ¿recortarlo proporcionalmente?
-MAX_FLEX_PER_HOUR    = None   # tope simultáneo kWh/h (None = sin tope)
+MAX_BLOCKS_PER_DAY   = 1      
+MAX_SHIFT_KWH        = 1.5    
+MAX_SHIFT_FRACTION   = 0.50   
+ALLOW_PARTIAL_LAST_BLOCK = False  
+MAX_FLEX_PER_HOUR    = None   
 
-# Precio: ¿permitimos negativos?
-ALLOW_NEGATIVE_PRICE = False   # pon True si quieres explotar precios negativos
+# Precio: 
+ALLOW_NEGATIVE_PRICE = False   
 
 np.random.seed(42); tf.random.set_seed(42)
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -65,15 +63,11 @@ def build_lstm_model(input_dim, seq_len=SEQ_LEN, horizon=HORIZON, units=64, drop
     return model
 
 def schedule_block_solar_then_price(block, nonflex_pred, pv_pred, price, scheduled_flex, hard_cutoff, avoid_overlap=True):
-    """
-    Primero usa excedente FV, y para lo que quede a red, minimiza coste horario.
-    block: np.array (kWh/h) de longitud d (p.ej., [1.1,1.1])
-    price: €/kWh por hora (longitud 24)
-    """
+   
     d = len(block)
     last_start = max(0, hard_cutoff - d)
     best_i, best_score = None, -1e18
-    W_SOLAR, W_PRICE = 1000.0, 1.0  # prioridad fuerte a FV
+    W_SOLAR, W_PRICE = 1000.0, 1.0  
 
     for i in range(0, last_start + 1):
         if avoid_overlap and np.any(scheduled_flex[i:i+d] > 1e-9):
@@ -82,7 +76,7 @@ def schedule_block_solar_then_price(block, nonflex_pred, pv_pred, price, schedul
         solar_used = np.minimum(block, solar_avail)
         grid_needed = block - solar_used
         solar_kwh = float(solar_used.sum())
-        grid_cost = float(np.dot(grid_needed, price[i:i+d]))  # € = kWh * €/kWh
+        grid_cost = float(np.dot(grid_needed, price[i:i+d])) 
         score = W_SOLAR * solar_kwh - W_PRICE * grid_cost
         if score > best_score:
             best_score, best_i = score, i
@@ -133,7 +127,7 @@ pos_start = df.index.get_loc(TARGET_DATE)
 if pos_start - SEQ_LEN < 0 or pos_start + HORIZON > len(df):
     raise ValueError("No hay suficiente historial/futuro para la ventana del día objetivo.")
 
-# Entrena con histórico previo (sin fuga temporal)
+# Entrena con histórico previo
 N_safe = pos_start - SEQ_LEN - HORIZON + 1
 if N_safe < 200:
     print(f"[ADVERTENCIA] Pocas ventanas históricas antes de {TARGET_DATE.date()}: N_safe={N_safe}")
@@ -193,21 +187,13 @@ pv_day_max = float(pred_pv.max())
 MIN_PV_FOR_LOAD = HARD_TARGET_MIN_PV if pv_day_max >= HARD_TARGET_MIN_PV else max(MIN_FLOOR, ADAPTIVE_RATIO * pv_day_max)
 print(f"[INFO] ({TARGET_DATE.date()}) Umbral PV: {MIN_PV_FOR_LOAD:.2f} kWh (pico {pv_day_max:.2f})")
 
-# ================== 5) GESTIÓN DE CARGAS — FV → PRECIO con LÍMITES ==================
-# Flex original (horas de partida; sirve para cuantificar energía desplazable)
+# ================== 5) GESTIÓN DE CARGAS  ==================
 orig_flex_raw = np.zeros(HORIZON)
-# ejemplo base (ajústalo a tu caso real)
-orig_flex_raw[21]+=1.1; orig_flex_raw[22]+=1.1   # termo 21-23
-orig_flex_raw[20]+=0.5; orig_flex_raw[21]+=0.4   # lavadora 20-22
-
-# CAPADO: la flex no puede comerse la base mínima
+orig_flex_raw[21]+=1.1; orig_flex_raw[22]+=1.1  
+orig_flex_raw[20]+=0.5; orig_flex_raw[21]+=0.4   
 headroom_pred = np.maximum(pred_demand - BASELINE_MIN_KWH, 0.0)
 orig_flex = np.minimum(orig_flex_raw, headroom_pred)
-
-# Base no flexible (no subirla artificialmente)
 nonflex_pred = np.clip(pred_demand - orig_flex, 0.0, None)
-
-# Cupo permitido de energía a desplazar
 total_flex_energy = float(orig_flex.sum())
 allowed_energy = total_flex_energy
 if MAX_SHIFT_KWH is not None:
@@ -219,7 +205,7 @@ remaining_energy = allowed_energy
 blocks_scheduled = 0
 scheduled = np.zeros(HORIZON)
 
-# === 3) Programación de bloques con FV→Precio y límites ===
+# === 3) Programación de bloques ===
 for name, block in FLEX_BLOCKS:
     if blocks_scheduled >= MAX_BLOCKS_PER_DAY or remaining_energy <= 1e-6:
         break
@@ -236,7 +222,7 @@ for name, block in FLEX_BLOCKS:
         block=block_to_place,
         nonflex_pred=nonflex_pred,
         pv_pred=pred_pv,
-        price=price_day_eff,            # << precio efectivo (con o sin negativos)
+        price=price_day_eff,            
         scheduled_flex=scheduled,
         hard_cutoff=HARD_CUTOFF_HOUR,
         avoid_overlap=AVOID_OVERLAP
@@ -255,7 +241,7 @@ for name, block in FLEX_BLOCKS:
     blocks_scheduled += 1
     print(f"[SCHEDULE] {name} @ {start:02d}:00 → {placed:.2f} kWh (restan {remaining_energy:.2f} kWh)")
 
-# Nada de reescalar a total_flex_energy: respetamos el límite impuesto
+
 moved_energy = float(scheduled.sum())
 leftover_orig = orig_flex.copy()
 if total_flex_energy > 1e-9:
@@ -263,11 +249,11 @@ if total_flex_energy > 1e-9:
     leftover_orig = orig_flex * (1.0 - moved_ratio)
 
 # Consumos (misma energía diaria, distinta distribución)
-cons_base_pred = nonflex_pred + orig_flex           # == pred_demand hora a hora
+cons_base_pred = nonflex_pred + orig_flex          
 cons_mng_pred  = nonflex_pred + leftover_orig + scheduled
 assert np.isclose(cons_base_pred.sum(), cons_mng_pred.sum(), atol=1e-6), "No se conserva la energía diaria."
 
-# === Balance energético ANTES vs DESPUÉS (PREDICCIONES) ===
+# === Balance energético ANTES vs DESPUÉS ===
 net_before = cons_base_pred - pred_pv
 imp_before = np.clip(net_before, 0, None)
 exp_before = np.clip(-net_before, 0, None)
@@ -286,7 +272,7 @@ print(f"Autoconsumo DESPUÉS : {autoc_after.sum():.3f} kWh  (Δ {autoc_after.sum
 print(f"Vertido ANTES       : {exp_before.sum():.3f} kWh")
 print(f"Vertido DESPUÉS     : {exp_after.sum():.3f} kWh   (Δ {exp_after.sum()-exp_before.sum():+.3f} kWh)")
 
-# === Métricas de error (1 día) DEMANDA y FV (MAPE robusto) ===
+# === Métricas de error DEMANDA y FV ===
 def compute_metrics(y_true, y_pred, mask=None):
     y_true = np.asarray(y_true, float)
     y_pred = np.asarray(y_pred, float)
@@ -303,7 +289,6 @@ mae_d, rmse_d, mape_d = compute_metrics(real_demand_day, pred_demand)       # De
 sun_mask = real_pv_day > 0.1
 mae_p, rmse_p, mape_p = compute_metrics(real_pv_day, pred_pv, mask=sun_mask)  # FV (solo horas con sol)
 
-# === Excel con resultados horarios, totales y métricas ===
 excel_path = os.path.join(OUT_DIR, f"resumen_gestion_{date_tag}.xlsx")
 
 # Pestaña 1: Horario
@@ -362,7 +347,7 @@ print(f"\n>>> Excel generado: {os.path.abspath(excel_path)}")
 
 
 # ================== 6) FIGURAS ==================
-# 6.1 Predicción pura (sin cargas)
+# 6.1 Predicción pura 
 tot_dem_est = float(pred_demand.sum()); tot_pv_est = float(pred_pv.sum())
 pv_vs_dem_pct = (tot_pv_est / tot_dem_est * 100) if tot_dem_est > 0 else float("nan")
 
@@ -382,7 +367,7 @@ plt.tight_layout()
 plt.savefig(os.path.join(OUT_DIR, f"fig1_pred_demanda_vs_pv_{date_tag}.png"), dpi=180)
 plt.close()
 
-# === 4) Figura final: Consumo base vs gestionado + FV + Precio ===
+# === 4) Figura: Consumo estimado vs gestionado + FV + Precio ===
 h = np.arange(HORIZON)
 fig, ax1 = plt.subplots(figsize=(12,4.8)); bar_w = 0.4
 
@@ -408,7 +393,7 @@ if not ALLOW_NEGATIVE_PRICE:
 # Compacta el rango del precio para que no “domine” el gráfico
 p_low, p_high = np.quantile(price_day_eff, [0.05, 0.95])
 margin = 0.05
-ax2.set_ylim(max(0, p_low - margin), p_high + margin)  # ajusta si quieres p. ej. (0.12, 0.22)
+ax2.set_ylim(max(0, p_low - margin), p_high + margin)  
 
 
 # Leyenda combinada
@@ -421,3 +406,4 @@ final_fig = os.path.join(OUT_DIR, f"fig5_consumo_fv_precio_{date_tag}.png")
 plt.savefig(final_fig, dpi=180)
 plt.close()
 print(">> Figura final con precio:", final_fig)
+
