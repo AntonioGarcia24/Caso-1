@@ -1,0 +1,523 @@
+import os, shutil, numpy as np, pandas as pd, matplotlib.pyplot as plt, tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
+from scipy.ndimage import gaussian_filter1d
+from scipy.optimize import linprog
+from scipy.signal import savgol_filter
+
+# ================== CONFIG GLOBAL ==================
+BASE_FOLDER = r"C:\Users\aanto\Documents\Python\TFM\Caso4"
+HOMES = {
+    "ancianos":      "ancianos.xlsx",
+    "familia":       "familia.xlsx",
+    "nocturno":      "nocturno.xlsx",
+    "parejajoven":   "parejajoven.xlsx",
+}
+OUT_ROOT = "Caso4"
+TARGET_DATE = "2024-03-18"   # YYYY-MM-DD (si no está en los datos, se aplica fallback)
+
+ALLOW_FALLBACK = True
+FALLBACK_STRATEGY = "same_month_day_any_year_then_nearest"
+
+# >>> TODO PRED <<<
+SEQ_LEN, HORIZON = 48, 24
+BATCH_SIZE, EPOCHS = 64, 15
+
+# Paleta
+COLOR_CONS = "#1f77b4"
+COLOR_GEST = "#ff7f0e"
+COLOR_PV   = "gold"
+COLOR_SOC  = "#2c3e50"
+COLOR_GRID = "#d62728"
+COLOR_BATT = "#2ecc71"
+
+# Batería
+BAT_CAP_KWH = 5.0
+SOC_MIN, SOC_MAX = 0.20, 1.00
+ETA_CH, ETA_DIS = 0.95, 0.95
+P_CH_MAX, P_DIS_MAX = 2.5, 2.5
+
+# Anti-ruido FV
+PV_MIN_CHARGE = 0.05
+SUNRISE_HH_FRAC = 8.3
+SUNRISE_RAMP_H  = 2.0
+SUNSET_RAMP_H   = 2.0
+
+# ===== Micro-shift =====
+USE_SHIFT = True
+SHIFT_TOTAL_KWH        = 0.8
+PEAK_SOURCE_HOURS      = [20, 21, 22]
+SECONDARY_SOURCE_HOURS = [7, 8, 6, 5]
+SOLAR_SINK_HOURS       = [11, 12, 13, 14, 15]
+MAX_TAKE_PER_H         = 0.35
+MAX_ADD_PER_H          = 0.35
+SRC_FRACTION_CAP       = 0.60
+SINK_ALIGN_WITH_PV     = True
+H22_REDUCTION_FRAC     = 0.5
+
+
+PV_ENFORCE_FACTOR = 0.50     
+PV_CAP_KWH_PER_H  = 5.0    
+
+np.random.seed(42); tf.random.set_seed(42)
+os.makedirs(OUT_ROOT, exist_ok=True)
+
+# ================== UTILIDADES ==================
+def cyclical_enc(x, T): return np.sin(2*np.pi*x/T), np.cos(2*np.pi*x/T)
+
+def guess_columns(df):
+    cols_l = [c.lower() for c in df.columns]
+    t_idx = next((i for i,c in enumerate(cols_l) if any(k in c for k in ["time","fecha","date","timestamp"])), None)
+    d_idx = next((i for i,c in enumerate(cols_l) if any(k in c for k in ["demand","demanda","load","consumo"])), None)
+    p_idx = next((i for i,c in enumerate(cols_l) if any(k in c for k in ["pv","solar","fotov","generacion","generación","generation"])), None)
+    return (df.columns[t_idx] if t_idx is not None else None,
+            df.columns[d_idx] if d_idx is not None else None,
+            df.columns[p_idx] if p_idx is not None else None)
+
+def make_windows(features, target, seq_len=SEQ_LEN, horizon=HORIZON):
+    X, y, T = [], [], len(features)
+    for t in range(T - seq_len - horizon + 1):
+        X.append(features[t:t+seq_len, :]); y.append(target[t+seq_len:t+seq_len+horizon])
+    return np.array(X, np.float32), np.array(y, np.float32)
+
+def build_lstm_model(input_dim, seq_len=SEQ_LEN, horizon=HORIZON, units=64, dropout=0.1):
+    inp = layers.Input(shape=(seq_len, input_dim))
+    x = layers.LSTM(units, return_sequences=True)(inp); x = layers.Dropout(dropout)(x)
+    x = layers.LSTM(units)(x); x = layers.Dropout(dropout)(x)
+    out = layers.Dense(horizon)(x)
+    model = models.Model(inp, out)
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="mae")
+    return model
+
+# ==== NATURALIZACIÓN FV ====
+def _smoothstep_quintic(u):
+    u = np.clip(u, 0.0, 1.0); return (6*u**5 - 15*u**4 - 0*0 + 10*u**3)
+
+def _ramp_quintic(h, start, width, rising=True):
+    if width <= 1e-6: return np.ones_like(h) if rising else np.zeros_like(h)
+    if rising:
+        u = (h - start) / width; y = (6*u**5 - 15*u**4 + 10*u**3)
+        y[h <= start] = 0.0; y[h >= start + width] = 1.0
+    else:
+        u = (start - h) / width; y = (6*u**5 - 15*u**4 + 10*u**3)
+        y[h <= start - width] = 1.0; y[h >= start] = 0.0
+    return np.clip(y, 0.0, 1.0)
+
+def _daylight_window(pv, thr):
+    pv_pos = np.where(np.clip(pv, 0.0, None) >= thr, pv, 0.0)
+    idx = np.where(pv_pos > 0.0)[0]
+    if idx.size == 0: return 8.0, 8.0
+    return float(idx[0]), float(idx[-1] + 1)
+
+def naturalize_pv_day_v2(pv_vec,
+                         pv_min=PV_MIN_CHARGE,
+                         sunrise_hint=SUNRISE_HH_FRAC,
+                         sramp_h=SUNRISE_RAMP_H, dramp_h=SUNSET_RAMP_H,
+                         savgol_max_win=9, savgol_poly=3, blend=0.25):
+    from scipy.signal import savgol_filter
+    pv0 = np.clip(np.asarray(pv_vec, dtype=float), 0.0, None)
+    pv0[pv0 < pv_min] = 0.0
+    sr, ss = _daylight_window(pv0, pv_min)
+    if ss - sr < 1e-6: return np.zeros_like(pv0)
+    h = np.arange(24, dtype=float)
+    t_peak = float(np.argmax(pv0))
+    if pv0[int(t_peak)] <= 0.0: t_peak = max(sr + 0.6*(ss - sr), sunrise_hint + 4.0)
+    w_rise = max(SUNRISE_RAMP_H, 0.35 * max(t_peak - sr, 1.0))
+    w_fall = max(SUNSET_RAMP_H,  0.35 * max(ss - t_peak, 1.0))
+    env = _ramp_quintic(h, sr, w_rise, True) * _ramp_quintic(h, ss, w_fall, False)
+    pv_env = pv0 * env
+    i0, i1 = max(int(np.floor(sr)),0), min(int(np.ceil(ss)),24)
+    pv_smooth = pv_env.copy()
+    if i1 - i0 >= 3:
+        L = i1 - i0
+        win = min(savgol_max_win, L if L % 2 == 1 else L-1)
+        win = max(3, win); win = win if win % 2 == 1 else win-1
+        poly = min(savgol_poly, win - 1)
+        pv_seg = pv_env[i0:i1]
+        pv_sg  = savgol_filter(pv_seg, window_length=win, polyorder=poly, mode="interp")
+        pv_smooth[i0:i1] = (1.0 - blend) * pv_sg + blend * pv_seg
+    pv_smooth = np.clip(pv_smooth, 0.0, None) * env
+    target, cur = pv_env.sum(), pv_smooth.sum()
+    if cur > 1e-9 and target > 0.0: pv_smooth *= (target / cur)
+    return pv_smooth
+
+def naturalize_pv_batch_v2(pv_batch_2d, **kw):
+    out = np.zeros_like(pv_batch_2d, dtype=float)
+    for i in range(pv_batch_2d.shape[0]): out[i] = naturalize_pv_day_v2(pv_batch_2d[i], **kw)
+    return out
+
+# ============ BATERÍA ============
+def optimize_battery_dispatch(load_ac, pv_ac,
+                              cap_kwh=BAT_CAP_KWH, eta_ch=ETA_CH, eta_dis=ETA_DIS,
+                              p_ch=P_CH_MAX, p_dis=P_DIS_MAX,
+                              soc_min=SOC_MIN, soc_max=SOC_MAX,
+                              pv_min_charge=PV_MIN_CHARGE):
+    H = len(load_ac)
+    pv_cl = np.clip(pv_ac.astype(float), 0.0, None)
+    pv_clean = np.where(pv_cl >= pv_min_charge, pv_cl, 0.0)
+
+    off_pv2l = 0
+    off_ch   = off_pv2l + H
+    off_exp  = off_ch   + H
+    off_imp  = off_exp  + H
+    off_bout = off_imp  + H
+    off_soc  = off_bout + H
+    n_vars   = off_soc  + (H + 1)
+
+    c = np.zeros(n_vars); c[off_imp:off_imp + H] = 1.0
+    A_eq, b_eq = [], []
+    for h in range(H):
+        row = np.zeros(n_vars); row[off_pv2l+h]=1; row[off_ch+h]=1; row[off_exp+h]=1
+        A_eq.append(row); b_eq.append(pv_clean[h])
+    for h in range(H):
+        row = np.zeros(n_vars); row[off_pv2l+h]=1; row[off_bout+h]=1; row[off_imp+h]=1
+        A_eq.append(row); b_eq.append(load_ac[h])
+    for h in range(H):
+        row = np.zeros(n_vars)
+        row[off_soc+h]=-1; row[off_soc+h+1]=1; row[off_ch+h]=-ETA_CH; row[off_bout+h]=1.0/ETA_DIS
+        A_eq.append(row); b_eq.append(0.0)
+    row = np.zeros(n_vars); row[off_soc+0]=1; row[off_soc+H]=-1
+    A_eq.append(row); b_eq.append(0.0)
+    A_eq = np.vstack(A_eq); b_eq = np.array(b_eq)
+
+    bounds = []
+    for _ in range(H): bounds.append((0.0, None))
+    for h in range(H): bounds.append((0.0, P_CH_MAX if pv_clean[h] > 0.0 else 0.0))
+    for _ in range(H): bounds.append((0.0, None))
+    for _ in range(H): bounds.append((0.0, None))
+    for _ in range(H): bounds.append((0.0, P_DIS_MAX))
+    soc_lo, soc_hi = SOC_MIN*BAT_CAP_KWH, SOC_MAX*BAT_CAP_KWH
+    for _ in range(H+1): bounds.append((soc_lo, soc_hi))
+    res = linprog(c, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs")
+    if not res.success: raise RuntimeError(f"LP no encontró solución: {res.message}")
+    x = res.x
+    pv2l = x[off_pv2l:off_pv2l+H]; ch = x[off_ch:off_ch+H]; exp = x[off_exp:off_exp+H]
+    imp = x[off_imp:off_imp+H]; bout = x[off_bout:off_bout+H]; soc_k = x[off_soc:off_soc+H+1]
+    return (ch, bout, imp, exp, pv2l + bout, (soc_k[:-1] / BAT_CAP_KWH) * 100.0)
+
+# ============ MICRO-SHIFT ============
+def micro_shift(cons_est, pv_est):
+    H = len(cons_est)
+    managed_delta = np.zeros(H, dtype=float)
+    if not USE_SHIFT or SHIFT_TOTAL_KWH <= 1e-6: return managed_delta
+    remaining = float(SHIFT_TOTAL_KWH)
+    ordered_sources = [h for h in (PEAK_SOURCE_HOURS + SECONDARY_SOURCE_HOURS) if 0 <= h < H]
+    take = np.zeros(H, dtype=float)
+    for h in ordered_sources:
+        if remaining <= 1e-9: break
+        cap_rel = SRC_FRACTION_CAP * cons_est[h]
+        cap_abs = MAX_TAKE_PER_H
+        if h == 22:
+            cap_abs *= H22_REDUCTION_FRAC; cap_rel *= H22_REDUCTION_FRAC
+        cap = max(0.0, min(cap_rel, cap_abs))
+        mv = min(remaining, cap)
+        take[h] -= mv; remaining -= mv
+    moved_out = -take.sum()
+    sinks = [h for h in SOLAR_SINK_HOURS if 0 <= h < H]
+    add = np.zeros(H, dtype=float)
+    weights = np.array([max(0.0, pv_est[h]) for h in sinks], dtype=float)
+    if weights.sum() <= 1e-9: weights = np.ones(len(sinks), dtype=float)
+    weights = weights / weights.sum()
+    add_remaining = float(moved_out)
+    for i, h in enumerate(sinks):
+        if add_remaining <= 1e-9: break
+        target_share = add_remaining * weights[i]
+        cap_abs = MAX_ADD_PER_H
+        if SINK_ALIGN_WITH_PV: cap_abs = min(cap_abs, pv_est[h] + 1e-6)
+        mv = min(target_share, cap_abs)
+        add[h] += mv
+    diff = add.sum() - moved_out
+    if abs(diff) > 1e-6 and sinks:
+        h_best = max(sinks, key=lambda hh: pv_est[hh]); add[h_best] -= diff
+    return take + add
+
+# ================== MÉTRICAS ==================
+def mae(y_true, y_pred): return float(np.mean(np.abs(y_true - y_pred)))
+def rmse(y_true, y_pred): return float(np.sqrt(np.mean((y_true - y_pred)**2)))
+def mape(y_true, y_pred, eps=1e-6):
+    denom = np.where(np.abs(y_true) < eps, eps, np.abs(y_true))
+    return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
+
+# ================== SELECCIÓN DÍA OBJETIVO ==================
+def pick_window_index(start_times, target_date_str, allow_fallback=True, strategy="same_month_day_any_year_then_nearest"):
+    target_dt = pd.Timestamp(target_date_str).normalize()
+    mask = (start_times.normalize() == target_dt) & (start_times.hour == 0)
+    cand_idx = np.where(mask)[0]
+    if len(cand_idx) > 0: return int(cand_idx[0]), target_dt, "exact"
+    if not allow_fallback:
+        first = start_times.min(); last = start_times.max()
+        raise ValueError(f"No hay ventana para {target_date_str} 00:00. Rango: {first} → {last}.")
+    if strategy.startswith("same_month_day_any_year"):
+        mm, dd = target_dt.month, target_dt.day
+        same_md = start_times[(start_times.month == mm) & (start_times.day == dd) & (start_times.hour == 0)]
+        if len(same_md) > 0:
+            chosen = same_md[0].normalize()
+            idx = np.where(start_times == same_md[0])[0][0]
+            return int(idx), chosen, "same_month_day_any_year"
+    diffs = np.abs((start_times.normalize() - target_dt).astype('timedelta64[h]').astype(int))
+    midnight_mask = (start_times.hour == 0)
+    diffs = np.where(midnight_mask, diffs, np.iinfo(np.int32).max)
+    idx = int(np.argmin(diffs)); chosen = start_times[idx].normalize()
+    return idx, chosen, "nearest"
+
+# ================== PROCESO POR VIVIENDA ==================
+def process_home(home_name, excel_path):
+    print(f"\n================= Vivienda: {home_name} =================")
+    raw = pd.read_excel(excel_path)
+    t_col, d_col, p_col = guess_columns(raw)
+    if not all([t_col, d_col, p_col]):
+        raise ValueError(f"[{home_name}] No se detectaron columnas tiempo/demanda/PV. Detectado: tiempo={t_col}, demanda={d_col}, pv={p_col}")
+
+    # --- parseo y malla horaria limpia con duplicados colapsados ---
+    df = raw[[t_col, d_col, p_col]].copy()
+    df.columns = ["timestamp", "demand_kWh", "pv_kWh"]
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"]).sort_values("timestamp").set_index("timestamp")
+    if df.index.has_duplicates: df = df.groupby(level=0, as_index=True).mean()
+    df = df.resample("H").interpolate(limit_direction="both")
+    df["demand_kWh"] = df["demand_kWh"].clip(lower=0); df["pv_kWh"] = df["pv_kWh"].clip(lower=0)
+
+    # dataset
+    hours_num = df.index.hour.values; doy_num = df.index.dayofyear.values
+    h_sin, h_cos = cyclical_enc(hours_num, 24); d_sin, d_cos = cyclical_enc(doy_num, 365.25)
+    feat = np.column_stack([df["demand_kWh"].values, df["pv_kWh"].values, h_sin, h_cos, d_sin, d_cos])
+    target_load, target_pv = df["demand_kWh"].values, df["pv_kWh"].values
+    X_all, yL_all = make_windows(feat, target_load, SEQ_LEN, HORIZON)
+    _,    yP_all  = make_windows(feat, target_pv,   SEQ_LEN, HORIZON)
+    N = len(X_all)
+    if N < 50: raise ValueError(f"[{home_name}] Muy pocos patrones tras el re-muestreo.")
+    n_train = int(0.75*N); n_val = int(0.10*N)
+    X_train, yL_train, yP_train = X_all[:n_train], yL_all[:n_train], yP_all[:n_train]
+    X_val,   yL_val,   yP_val   = X_all[n_train:n_train+n_val], yL_all[n_train:n_train+n_val], yP_all[n_train:n_train+n_val]
+    X_test,  yL_test,  yP_test  = X_all[n_train+n_val:], yL_all[n_train+n_val:], yP_all[n_train+n_val:]
+
+    # modelos
+    input_dim = X_all.shape[-1]
+    model_load = build_lstm_model(input_dim)
+    model_pv   = build_lstm_model(input_dim)
+    cb = [callbacks.EarlyStopping(patience=6, restore_best_weights=True, monitor="val_loss"),
+          callbacks.ReduceLROnPlateau(patience=3, factor=0.5, min_lr=1e-5)]
+    print(f"[{home_name}] Entrenando Demanda..."); 
+    model_load.fit(X_train, yL_train, validation_data=(X_val, yL_val),
+                   epochs=EPOCHS, batch_size=BATCH_SIZE, callbacks=cb, verbose=0)
+    print(f"[{home_name}] Entrenando FV...");
+    model_pv.fit(X_train, yP_train, validation_data=(X_val, yP_val),
+                 epochs=EPOCHS, batch_size=BATCH_SIZE, callbacks=cb, verbose=0)
+
+    # evaluación test
+    pred_L_test = model_load.predict(X_test, batch_size=256, verbose=0)
+    pred_P_test = model_pv.predict(X_test,   batch_size=256, verbose=0)
+    yL_flat, pL_flat = yL_test.flatten(), pred_L_test.flatten()
+    yP_flat, pP_flat = yP_test.flatten(), pred_P_test.flatten()
+    def _mae(a,b): return float(np.mean(np.abs(a-b)))
+    def _rmse(a,b): return float(np.sqrt(np.mean((a-b)**2)))
+    def _mape(a,b,eps=1e-6):
+        denom = np.where(np.abs(a)<eps, eps, np.abs(a))
+        return float(np.mean(np.abs((a-b)/denom))*100.0)
+    metrics_test = {
+        "Demanda_MAE_test": _mae(yL_flat,pL_flat),
+        "Demanda_RMSE_test": _rmse(yL_flat,pL_flat),
+        "Demanda_MAPE_%_test": _mape(yL_flat,pL_flat),
+        "FV_MAE_test": _mae(yP_flat,pP_flat),
+        "FV_RMSE_test": _rmse(yP_flat,pP_flat),
+        "FV_MAPE_%_test": _mape(yP_flat,pP_flat),
+    }
+    print(f"[{home_name}] TEST → Demanda MAE {metrics_test['Demanda_MAE_test']:.3f} | FV MAE {metrics_test['FV_MAE_test']:.3f}")
+
+    # predicción + naturalización
+    pred_demand_all = model_load.predict(X_all, batch_size=256, verbose=0)
+    pred_pv_all     = model_pv.predict(X_all,   batch_size=256, verbose=0)
+    pred_pv_all = naturalize_pv_batch_v2(pred_pv_all,
+        pv_min=PV_MIN_CHARGE, sunrise_hint=SUNRISE_HH_FRAC,
+        sramp_h=SUNRISE_RAMP_H, dramp_h=SUNSET_RAMP_H, savgol_max_win=9, savgol_poly=3, blend=0.25
+    )
+
+    # selección del día con fallback
+    start_times = df.index[SEQ_LEN : SEQ_LEN + len(pred_demand_all)]
+    best_idx, chosen_date, reason = pick_window_index(
+        start_times, TARGET_DATE, allow_fallback=ALLOW_FALLBACK, strategy=FALLBACK_STRATEGY
+    )
+    if reason != "exact":
+        print(f"[{home_name}] AVISO: {TARGET_DATE} no está en los datos. Usando {chosen_date.date()} (motivo: {reason}).")
+
+    # carpetas (limpiar para evitar PNGs antiguos)
+    OUT_DIR = os.path.join(OUT_ROOT, home_name)
+    OUT_DIR_DATE = os.path.join(OUT_DIR, f"dia_{chosen_date.strftime('%Y%m%d')}")
+    if os.path.isdir(OUT_DIR_DATE): 
+        # borra solo imágenes antiguas
+        for f in os.listdir(OUT_DIR_DATE):
+            if f.lower().endswith((".png",".jpg",".jpeg")):
+                os.remove(os.path.join(OUT_DIR_DATE,f))
+    os.makedirs(OUT_DIR_DATE, exist_ok=True)
+
+    # series del día (PRED) + ENFORCE de FV
+    cons_base = pred_demand_all[best_idx].astype(float)
+    pv_base   = pred_pv_all[best_idx].astype(float)
+
+    # >>> ENFORCING: escala diaria y cap físico <<<
+    if abs(PV_ENFORCE_FACTOR - 1.0) > 1e-9:
+        pv_total_before = float(pv_base.sum())
+        pv_base *= PV_ENFORCE_FACTOR
+        print(f"[{home_name}] ENFORCE: PV ×{PV_ENFORCE_FACTOR:.2f}. Total {pv_total_before:.2f} → {pv_base.sum():.2f} kWh")
+
+    pv_peak = float(pv_base.max())
+    if pv_peak > PV_CAP_KWH_PER_H + 1e-9:
+        pv_base *= (PV_CAP_KWH_PER_H / pv_peak)
+        print(f"[{home_name}] CAP FV: pico {pv_peak:.2f} → {PV_CAP_KWH_PER_H:.2f} kWh/h")
+
+    start_obj = SEQ_LEN + best_idx
+    hours_pred_index = df.index[start_obj:start_obj + HORIZON]
+    print(f"[{home_name}] Día usado: {hours_pred_index[0].date()}  "
+          f"FV_pred_total={pv_base.sum():.2f} kWh  Demanda_pred_total={cons_base.sum():.2f} kWh  (pico FV={pv_base.max():.2f})")
+
+    # métricas del DÍA vs targets de esa ventana (solo informativas)
+    yL_day = yL_all[best_idx].astype(float)
+    yP_day = yP_all[best_idx].astype(float)
+    metrics_day = {
+        "Demanda_MAE_dia": _mae(yL_day, cons_base),
+        "Demanda_RMSE_dia": _rmse(yL_day, cons_base),
+        "Demanda_MAPE_%_dia": _mape(yL_day, cons_base),
+        "FV_MAE_dia": _mae(yP_day, pv_base),
+        "FV_RMSE_dia": _rmse(yP_day, pv_base),
+        "FV_MAPE_%_dia": _mape(yP_day, pv_base),
+    }
+    metrics_df = pd.DataFrame([
+        {"scope":"TEST", **metrics_test},
+        {"scope":"DIA_OBJETIVO", **metrics_day},
+    ])
+    metrics_path = os.path.join(OUT_DIR_DATE, "metrics_pred.csv")
+    metrics_df.to_csv(metrics_path, index=False, encoding="utf-8")
+    print(f"[{home_name}] Métricas guardadas → {metrics_path}")
+
+    # micro-shift y consumo gestionado
+    managed_delta = micro_shift(cons_base, pv_base)
+    cons_gestion  = np.clip(cons_base + managed_delta, 0.0, None)
+
+    # batería LP (pred)
+    (ch_b0, dis_b0, imp_b0, exp_b0, self_b0, soc_b0) = optimize_battery_dispatch(
+        cons_base, pv_base, cap_kwh=BAT_CAP_KWH, eta_ch=ETA_CH, eta_dis=ETA_DIS,
+        p_ch=P_CH_MAX, p_dis=P_DIS_MAX, soc_min=SOC_MIN, soc_max=SOC_MAX, pv_min_charge=PV_MIN_CHARGE
+    )
+    (ch_b1, dis_b1, imp_b1, exp_b1, self_b1, soc_b1) = optimize_battery_dispatch(
+        cons_gestion, pv_base, cap_kwh=BAT_CAP_KWH, eta_ch=ETA_CH, eta_dis=ETA_DIS,
+        p_ch=P_CH_MAX, p_dis=P_DIS_MAX, soc_min=SOC_MIN, soc_max=SOC_MAX, pv_min_charge=PV_MIN_CHARGE
+    )
+
+    # CSV horario
+    summary = pd.DataFrame({
+        "Hora": [t.strftime("%H:%M") for t in hours_pred_index],
+        "Base_usada": ["pred"]*HORIZON,
+        "Consumo_pred_base_kWh":        np.round(cons_base, 3),
+        "Consumo_pred_gestionado_kWh":  np.round(cons_gestion, 3),
+        "PV_pred_kWh":                  np.round(pv_base, 3),
+        "Delta_shift_kWh":              np.round(managed_delta, 3),
+        "BATT_Carga_ANTES_kWh":         np.round(ch_b0, 3),
+        "BATT_Descarga_ANTES_kWh":      np.round(dis_b0, 3),
+        "Importe_red_ANTES_kWh":        np.round(imp_b0, 3),
+        "Vertido_ANTES_kWh":            np.round(exp_b0, 3),
+        "BATT_Carga_DESPUES_kWh":       np.round(ch_b1, 3),
+        "BATT_Descarga_DESPUES_kWh":    np.round(dis_b1, 3),
+        "Importe_red_DESPUES_kWh":      np.round(imp_b1, 3),
+        "Vertido_DESPUES_kWh":          np.round(exp_b1, 3),
+    })
+    summary_path = os.path.join(OUT_DIR_DATE, "detalle_horario.csv")
+    summary.to_csv(summary_path, index=False, encoding="utf-8")
+    print(f"[{home_name}] CSV horario → {summary_path}")
+
+    # ================== GRÁFICAS ==================
+    h = np.arange(HORIZON)
+    tot_cons_base = float(cons_base.sum())
+    tot_cons_gest = float(cons_gestion.sum())
+    tot_pv_base   = float(pv_base.sum())
+    soc_for_plot  = gaussian_filter1d(soc_b1, sigma=1.0)
+
+    # Fig 1
+    fig, ax1 = plt.subplots(figsize=(12, 4.6))
+    bar_w = 0.4
+    ax1.bar(h - bar_w/2, cons_base,    width=bar_w, color=COLOR_CONS, alpha=0.90,
+            label=f"Consumo estimado ({tot_cons_base:.2f} kWh)")
+    ax1.bar(h + bar_w/2, cons_gestion, width=bar_w, color=COLOR_GEST, alpha=0.90,
+            label=f"Consumo gestionado ({tot_cons_gest:.2f} kWh)")
+    ax1.plot(h, pv_base, linestyle="--", linewidth=2, color=COLOR_PV,
+             label=f"Producción FV estimada ({tot_pv_base:.2f} kWh)")
+    ax1.set_title(f"{home_name.upper()} — Consumo estimado vs gestionado (suma cero) con batería")
+    ax1.set_xlabel("Hora"); ax1.set_ylabel("kWh")
+    ax1.set_xticks(h); ax1.grid(True, linestyle="--", alpha=0.35)
+    ax2 = ax1.twinx(); ax2.set_ylabel("SOC (%)"); ax2.set_ylim(0, 100)
+    ax2.plot(h, soc_for_plot, linewidth=2.2, color=COLOR_SOC, label="SOC (%)")
+    ax2.spines["right"].set_color("#555"); ax2.tick_params(axis="y", colors="#333"); ax2.grid(False)
+    h1, l1 = ax1.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+    bylabel = dict(zip(l1 + l2, h1 + h2))
+    ax1.legend(bylabel.values(), bylabel.keys(), loc="upper left", bbox_to_anchor=(0.01, 0.99),
+               fontsize=9, frameon=True, framealpha=0.75, labelspacing=0.35,
+               handlelength=1.4, handletextpad=0.5, borderpad=0.35)
+    plt.tight_layout()
+    fig_path1 = os.path.join(OUT_DIR_DATE, "fig_consumo_y_soc_PRED.png")
+    plt.savefig(fig_path1, dpi=180); plt.close()
+
+    # Fig 2
+    pv2load = np.clip(self_b1 - dis_b1, 0.0, None)
+    grid    = np.clip(imp_b1, 0.0, None)
+    batt    = np.clip(dis_b1, 0.0, None)
+    comp_sum = pv2load + grid + batt
+    corr     = cons_gestion - comp_sum
+    grid     = np.clip(grid + corr, 0.0, None)
+    tot_pv2load = float(pv2load.sum())
+    tot_grid    = float(grid.sum())
+    tot_batt    = float(batt.sum())
+    fig, ax1 = plt.subplots(figsize=(12.5, 4.8))
+    bar_w = 0.62
+    ax1.bar(h, pv2load, width=bar_w, color=COLOR_PV,  alpha=0.95, label=f"PV directo a la carga ({tot_pv2load:.2f} kWh)")
+    ax1.bar(h, grid,    width=bar_w, bottom=pv2load, color=COLOR_GRID, alpha=0.90, label=f"Importe de red ({tot_grid:.2f} kWh)")
+    ax1.bar(h, batt,    width=bar_w, bottom=pv2load + grid, color=COLOR_BATT, alpha=0.95, label=f"Batería a la carga ({tot_batt:.2f} kWh)")
+    ax1.plot(h, pv_base, linestyle="--", linewidth=2, color=COLOR_PV, label=f"Producción FV estimada ({tot_pv_base:.2f} kWh)")
+    ax1.set_title(f"{home_name.upper()} — Consumo gestionado por fuente")
+    ax1.set_xlabel("Hora"); ax1.set_ylabel("kWh")
+    ax1.set_xticks(h); ax1.grid(True, linestyle="--", alpha=0.35)
+    ax2 = ax1.twinx(); ax2.set_ylabel("SOC (%)"); ax2.set_ylim(0, 100)
+    ax2.plot(h, soc_for_plot, linewidth=2.2, color=COLOR_SOC, label="SOC (%)")
+    ax2.spines["right"].set_color("#555"); ax2.tick_params(axis="y", colors="#333"); ax2.grid(False)
+    h1, l1 = ax1.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+    bylabel = dict(zip(l1 + l2, h1 + h2))
+    ax1.legend(bylabel.values(), bylabel.keys(), loc="upper left", bbox_to_anchor=(0.01, 0.99),
+               fontsize=9, frameon=True, framealpha=0.75, labelspacing=0.35,
+               handlelength=1.4, handletextpad=0.5, borderpad=0.35)
+    plt.tight_layout()
+    fig_path2 = os.path.join(OUT_DIR_DATE, "fig_consumo_por_fuente_PRED.png")
+    plt.savefig(fig_path2, dpi=180); plt.close()
+    print(f"[{home_name}] Figuras → {fig_path1} | {fig_path2}")
+
+    # Resumen ANTES vs DESPUÉS
+    def totals_pred(cons, pv):
+        (ch0, dis0, imp0, exp0, self0, soc0) = optimize_battery_dispatch(cons, pv,
+            cap_kwh=BAT_CAP_KWH, eta_ch=ETA_CH, eta_dis=ETA_DIS,
+            p_ch=P_CH_MAX, p_dis=P_DIS_MAX, soc_min=SOC_MIN, soc_max=SOC_MAX, pv_min_charge=PV_MIN_CHARGE)
+        (ch1, dis1, imp1, exp1, self1, soc1) = optimize_battery_dispatch(np.clip(cons + managed_delta,0,None), pv,
+            cap_kwh=BAT_CAP_KWH, eta_ch=ETA_CH, eta_dis=ETA_DIS,
+            p_ch=P_CH_MAX, p_dis=P_DIS_MAX, soc_min=SOC_MIN, soc_max=SOC_MAX, pv_min_charge=PV_MIN_CHARGE)
+        return {
+            "Consumo_total_base_kWh": float(cons.sum()),
+            "Consumo_total_gestion_kWh": float(np.clip(cons + managed_delta,0,None).sum()),
+            "PV_total_kWh": float(pv.sum()),
+            "Importe_red_ANTES_kWh": float(imp0.sum()),
+            "Importe_red_DESPUES_kWh": float(imp1.sum()),
+            "Vertido_ANTES_kWh": float(exp0.sum()),
+            "Vertido_DESPUES_kWh": float(exp1.sum()),
+            "Uso_bateria_ANTES_kWh": float(dis0.sum()),
+            "Uso_bateria_DESPUES_kWh": float(dis1.sum()),
+        }
+    stats_pred = totals_pred(cons_base, pv_base)
+    tabla = pd.DataFrame([{"basis":"PRED", **stats_pred}])
+    out_csv2 = os.path.join(OUT_DIR_DATE, "resumen_antes_despues.csv")
+    tabla.to_csv(out_csv2, index=False, encoding="utf-8")
+    print(f"[{home_name}] Resumen → {out_csv2}")
+    print(f"[{home_name}] Suma cero OK:", abs(float(cons_base.sum()) - float(cons_gestion.sum())) < 1e-6)
+
+# ================== MAIN ==================
+if __name__ == "__main__":
+    for home, fname in HOMES.items():
+        path = os.path.join(BASE_FOLDER, fname)
+        if not os.path.isfile(path):
+            print(f"[AVISO] No se encuentra el fichero de {home}: {path}")
+            continue
+        process_home(home, path)
+    print("\n--- Caso 4 (OnlyPred) finalizado. Archivos en:", os.path.abspath(OUT_ROOT))
